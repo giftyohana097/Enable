@@ -12,6 +12,14 @@
 (define-constant err-booking-already-cancelled (err u110))
 (define-constant err-invalid-rating (err u111))
 (define-constant err-cannot-rate-own-service (err u112))
+(define-constant err-equipment-not-found (err u113))
+(define-constant err-equipment-not-available (err u114))
+(define-constant err-loan-not-found (err u115))
+(define-constant err-unauthorized-equipment (err u116))
+(define-constant err-equipment-already-loaned (err u117))
+(define-constant err-loan-already-returned (err u118))
+(define-constant err-invalid-condition (err u119))
+(define-constant err-cannot-rate-own-equipment (err u120))
 
 (define-non-fungible-token enable-token uint)
 
@@ -84,6 +92,77 @@
         total-rating: uint,
         rating-count: uint,
         revenue: uint
+    }
+)
+
+(define-data-var last-equipment-id uint u0)
+(define-data-var last-loan-id uint u0)
+
+(define-map accessibility-equipment
+    uint
+    {
+        owner: principal,
+        name: (string-ascii 64),
+        category: (string-ascii 32),
+        description: (string-ascii 256),
+        condition: (string-ascii 16),
+        daily-rate: uint,
+        deposit-required: uint,
+        available: bool,
+        total-loans: uint,
+        maintenance-notes: (string-ascii 256)
+    }
+)
+
+(define-map equipment-loans
+    uint
+    {
+        equipment-id: uint,
+        borrower: principal,
+        owner: principal,
+        start-date: uint,
+        end-date: uint,
+        actual-return-date: (optional uint),
+        status: (string-ascii 16),
+        total-cost: uint,
+        deposit-paid: uint,
+        condition-at-loan: (string-ascii 16),
+        condition-at-return: (optional (string-ascii 16))
+    }
+)
+
+(define-map owner-equipment
+    principal
+    (list 20 uint)
+)
+
+(define-map borrower-loans
+    principal
+    (list 30 uint)
+)
+
+(define-map equipment-ratings
+    uint
+    {
+        loan-id: uint,
+        equipment-id: uint,
+        borrower: principal,
+        owner: principal,
+        rating: uint,
+        review: (string-ascii 256),
+        timestamp: uint
+    }
+)
+
+(define-map borrower-reputation
+    principal
+    {
+        total-loans: uint,
+        successful-returns: uint,
+        late-returns: uint,
+        damage-incidents: uint,
+        average-care-rating: uint,
+        total-care-ratings: uint
     }
 )
 
@@ -383,3 +462,269 @@
         err-booking-not-found
     )
 )
+
+(define-public (register-equipment
+    (name (string-ascii 64))
+    (category (string-ascii 32))
+    (description (string-ascii 256))
+    (condition (string-ascii 16))
+    (daily-rate uint)
+    (deposit-required uint)
+    (maintenance-notes (string-ascii 256))
+)
+    (let
+        (
+            (new-equipment-id (+ (var-get last-equipment-id) u1))
+            (current-owner-equipment (default-to (list) (map-get? owner-equipment tx-sender)))
+            (user-registration (unwrap! (map-get? registrations tx-sender) err-not-registered))
+        )
+        (asserts! (and (is-eq (get status user-registration) "active") 
+                      (> (get expiration user-registration) stacks-block-height)) err-invalid-status)
+        (asserts! (> daily-rate u0) err-invalid-booking)
+        (asserts! (> deposit-required u0) err-invalid-booking)
+        (var-set last-equipment-id new-equipment-id)
+        (map-set accessibility-equipment new-equipment-id
+            {
+                owner: tx-sender,
+                name: name,
+                category: category,
+                description: description,
+                condition: condition,
+                daily-rate: daily-rate,
+                deposit-required: deposit-required,
+                available: true,
+                total-loans: u0,
+                maintenance-notes: maintenance-notes
+            }
+        )
+        (ok (map-set owner-equipment tx-sender 
+            (unwrap! (as-max-len? (append current-owner-equipment new-equipment-id) u20) err-invalid-booking)
+        ))
+    )
+)
+
+(define-public (update-equipment-availability
+    (equipment-id uint)
+    (available bool)
+)
+    (let
+        (
+            (equipment (unwrap! (map-get? accessibility-equipment equipment-id) err-equipment-not-found))
+        )
+        (asserts! (is-eq tx-sender (get owner equipment)) err-unauthorized-equipment)
+        (ok (map-set accessibility-equipment equipment-id
+            (merge equipment { available: available })
+        ))
+    )
+)
+
+(define-public (create-equipment-loan
+    (equipment-id uint)
+    (start-date uint)
+    (end-date uint)
+)
+    (let
+        (
+            (equipment (unwrap! (map-get? accessibility-equipment equipment-id) err-equipment-not-found))
+            (new-loan-id (+ (var-get last-loan-id) u1))
+            (loan-duration (- end-date start-date))
+            (total-cost (* (get daily-rate equipment) loan-duration))
+            (current-borrower-loans (default-to (list) (map-get? borrower-loans tx-sender)))
+            (user-registration (unwrap! (map-get? registrations tx-sender) err-not-registered))
+        )
+        (asserts! (not (is-eq tx-sender (get owner equipment))) err-unauthorized-equipment)
+        (asserts! (get available equipment) err-equipment-not-available)
+        (asserts! (> start-date stacks-block-height) err-invalid-booking)
+        (asserts! (> end-date start-date) err-invalid-booking)
+        (asserts! (and (is-eq (get status user-registration) "active") 
+                      (> (get expiration user-registration) stacks-block-height)) err-invalid-status)
+        (var-set last-loan-id new-loan-id)
+        (map-set equipment-loans new-loan-id
+            {
+                equipment-id: equipment-id,
+                borrower: tx-sender,
+                owner: (get owner equipment),
+                start-date: start-date,
+                end-date: end-date,
+                actual-return-date: none,
+                status: "pending",
+                total-cost: total-cost,
+                deposit-paid: (get deposit-required equipment),
+                condition-at-loan: (get condition equipment),
+                condition-at-return: none
+            }
+        )
+        (map-set borrower-loans tx-sender 
+            (unwrap! (as-max-len? (append current-borrower-loans new-loan-id) u30) err-invalid-booking)
+        )
+        (map-set accessibility-equipment equipment-id
+            (merge equipment { available: false })
+        )
+        (let
+            (
+                (borrower-rep (default-to { total-loans: u0, successful-returns: u0, late-returns: u0, damage-incidents: u0, average-care-rating: u0, total-care-ratings: u0 } 
+                             (map-get? borrower-reputation tx-sender)))
+            )
+            (ok (map-set borrower-reputation tx-sender
+                (merge borrower-rep { total-loans: (+ (get total-loans borrower-rep) u1) })
+            ))
+        )
+    )
+)
+
+(define-public (approve-loan (loan-id uint))
+    (let
+        (
+            (loan (unwrap! (map-get? equipment-loans loan-id) err-loan-not-found))
+        )
+        (asserts! (is-eq tx-sender (get owner loan)) err-unauthorized-equipment)
+        (asserts! (is-eq (get status loan) "pending") err-invalid-booking)
+        (ok (map-set equipment-loans loan-id
+            (merge loan { status: "approved" })
+        ))
+    )
+)
+
+(define-public (return-equipment
+    (loan-id uint)
+    (return-condition (string-ascii 16))
+)
+    (let
+        (
+            (loan (unwrap! (map-get? equipment-loans loan-id) err-loan-not-found))
+            (equipment (unwrap! (map-get? accessibility-equipment (get equipment-id loan)) err-equipment-not-found))
+            (is-late (> stacks-block-height (get end-date loan)))
+        )
+        (asserts! (is-eq tx-sender (get borrower loan)) err-unauthorized-equipment)
+        (asserts! (is-eq (get status loan) "approved") err-invalid-booking)
+        (asserts! (is-none (get actual-return-date loan)) err-loan-already-returned)
+        (map-set equipment-loans loan-id
+            (merge loan { 
+                actual-return-date: (some stacks-block-height),
+                status: "returned",
+                condition-at-return: (some return-condition)
+            })
+        )
+        (map-set accessibility-equipment (get equipment-id loan)
+            (merge equipment { 
+                available: true,
+                condition: return-condition,
+                total-loans: (+ (get total-loans equipment) u1)
+            })
+        )
+        (let
+            (
+                (borrower-rep (default-to { total-loans: u0, successful-returns: u0, late-returns: u0, damage-incidents: u0, average-care-rating: u0, total-care-ratings: u0 } 
+                             (map-get? borrower-reputation (get borrower loan))))
+            )
+            (if is-late
+                (map-set borrower-reputation (get borrower loan)
+                    (merge borrower-rep { late-returns: (+ (get late-returns borrower-rep) u1) })
+                )
+                (map-set borrower-reputation (get borrower loan)
+                    (merge borrower-rep { successful-returns: (+ (get successful-returns borrower-rep) u1) })
+                )
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (rate-equipment
+    (loan-id uint)
+    (rating uint)
+    (review (string-ascii 256))
+)
+    (let
+        (
+            (loan (unwrap! (map-get? equipment-loans loan-id) err-loan-not-found))
+        )
+        (asserts! (is-eq tx-sender (get borrower loan)) err-unauthorized-equipment)
+        (asserts! (is-eq (get status loan) "returned") err-invalid-booking)
+        (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+        (asserts! (not (is-eq tx-sender (get owner loan))) err-cannot-rate-own-equipment)
+        (ok (map-set equipment-ratings loan-id
+            {
+                loan-id: loan-id,
+                equipment-id: (get equipment-id loan),
+                borrower: tx-sender,
+                owner: (get owner loan),
+                rating: rating,
+                review: review,
+                timestamp: stacks-block-height
+            }
+        ))
+    )
+)
+
+(define-public (rate-borrower-care
+    (loan-id uint)
+    (care-rating uint)
+)
+    (let
+        (
+            (loan (unwrap! (map-get? equipment-loans loan-id) err-loan-not-found))
+            (borrower-rep (default-to { total-loans: u0, successful-returns: u0, late-returns: u0, damage-incidents: u0, average-care-rating: u0, total-care-ratings: u0 } 
+                         (map-get? borrower-reputation (get borrower loan))))
+        )
+        (asserts! (is-eq tx-sender (get owner loan)) err-unauthorized-equipment)
+        (asserts! (is-eq (get status loan) "returned") err-invalid-booking)
+        (asserts! (and (>= care-rating u1) (<= care-rating u5)) err-invalid-rating)
+        (let
+            (
+                (new-total-ratings (+ (get total-care-ratings borrower-rep) care-rating))
+                (new-rating-count (+ (get total-care-ratings borrower-rep) u1))
+            )
+            (ok (map-set borrower-reputation (get borrower loan)
+                (merge borrower-rep { 
+                    average-care-rating: (/ new-total-ratings new-rating-count),
+                    total-care-ratings: new-rating-count
+                })
+            ))
+        )
+    )
+)
+
+(define-read-only (get-equipment-details (equipment-id uint))
+    (ok (unwrap! (map-get? accessibility-equipment equipment-id) err-equipment-not-found))
+)
+
+(define-read-only (get-loan-details (loan-id uint))
+    (ok (unwrap! (map-get? equipment-loans loan-id) err-loan-not-found))
+)
+
+(define-read-only (get-owner-equipment (owner principal))
+    (ok (default-to (list) (map-get? owner-equipment owner)))
+)
+
+(define-read-only (get-borrower-loans (borrower principal))
+    (ok (default-to (list) (map-get? borrower-loans borrower)))
+)
+
+(define-read-only (get-equipment-rating (loan-id uint))
+    (map-get? equipment-ratings loan-id)
+)
+
+(define-read-only (get-borrower-reputation (borrower principal))
+    (ok (default-to { total-loans: u0, successful-returns: u0, late-returns: u0, damage-incidents: u0, average-care-rating: u0, total-care-ratings: u0 } 
+       (map-get? borrower-reputation borrower)))
+)
+
+(define-read-only (is-equipment-available (equipment-id uint))
+    (match (map-get? accessibility-equipment equipment-id)
+        equipment (ok (get available equipment))
+        err-equipment-not-found
+    )
+)
+
+(define-read-only (calculate-loan-cost 
+    (equipment-id uint) 
+    (days uint)
+)
+    (match (map-get? accessibility-equipment equipment-id)
+        equipment (ok (* (get daily-rate equipment) days))
+        err-equipment-not-found
+    )
+)
+
+
