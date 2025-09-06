@@ -20,6 +20,33 @@
 (define-constant err-loan-already-returned (err u118))
 (define-constant err-invalid-condition (err u119))
 (define-constant err-cannot-rate-own-equipment (err u120))
+(define-constant err-contract-paused (err u121))
+(define-constant err-admin-only (err u122))
+(define-constant err-already-admin (err u123))
+(define-constant err-not-admin (err u124))
+(define-constant err-invalid-disability-type (err u125))
+(define-constant err-invalid-service-type (err u126))
+(define-constant err-invalid-equipment-category (err u127))
+(define-constant err-invalid-priority-level (err u128))
+(define-constant err-invalid-cost (err u129))
+(define-constant err-invalid-duration (err u130))
+(define-constant err-booking-conflict (err u131))
+(define-constant err-insufficient-priority (err u132))
+
+;; Valid status values
+(define-constant valid-statuses (list "active" "inactive" "suspended" "pending" "expired"))
+
+;; Valid disability types
+(define-constant valid-disability-types (list "mobility" "visual" "hearing" "cognitive" "multiple" "temporary" "other"))
+
+;; Valid equipment categories
+(define-constant valid-equipment-categories (list "mobility" "visual-aid" "hearing-aid" "communication" "daily-living" "therapeutic" "other"))
+
+;; Valid booking/loan statuses
+(define-constant valid-booking-statuses (list "pending" "confirmed" "completed" "cancelled" "in-progress"))
+
+;; Valid equipment conditions
+(define-constant valid-equipment-conditions (list "excellent" "good" "fair" "needs-repair" "damaged"))
 
 (define-non-fungible-token enable-token uint)
 
@@ -31,7 +58,8 @@
         status: (string-ascii 16),
         expiration: uint,
         priority-level: uint,
-        verification-authority: principal
+        verification-authority: principal,
+        notes: (string-ascii 256)
     }
 )
 
@@ -166,29 +194,43 @@
     }
 )
 
+;; Admin and pause functionality
+(define-data-var contract-paused bool false)
+(define-map contract-admins principal bool)
+
+;; Set contract owner as initial admin
+(map-set contract-admins contract-owner true)
+
 (define-public (register-user 
+    (user principal)
     (disability-type (string-ascii 64))
     (status (string-ascii 16))
     (expiration uint)
     (priority-level uint)
+    (notes (string-ascii 256))
 )
     (let
         (
             (new-id (+ (var-get last-token-id) u1))
         )
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-        (asserts! (is-none (map-get? registrations tx-sender)) err-already-registered)
-        (try! (nft-mint? enable-token new-id tx-sender))
+        (asserts! (is-none (map-get? registrations user)) err-already-registered)
+        (asserts! (is-valid-disability-type disability-type) err-invalid-disability-type)
+        (asserts! (is-valid-status status) err-invalid-status)
+        (asserts! (is-valid-priority-level priority-level) err-invalid-priority-level)
+        (asserts! (> expiration stacks-block-height) err-invalid-booking)
+        (try! (nft-mint? enable-token new-id user))
         (var-set last-token-id new-id)
         (ok (map-set registrations
-            tx-sender
+            user
             {
                 token-id: new-id,
                 disability-type: disability-type,
                 status: status,
                 expiration: expiration,
                 priority-level: priority-level,
-                verification-authority: tx-sender
+                verification-authority: tx-sender,
+                notes: notes
             }
         ))
     )
@@ -203,6 +245,7 @@
             (current-registration (unwrap! (map-get? registrations user) err-not-registered))
         )
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-valid-status new-status) err-invalid-status)
         (ok (map-set registrations
             user
             (merge current-registration { status: new-status })
@@ -230,14 +273,17 @@
     (name (string-ascii 64))
     (services (string-ascii 256))
 )
-    (ok (map-set service-providers
-        tx-sender
-        {
-            name: name,
-            services: services,
-            active: true
-        }
-    ))
+    (begin
+        (asserts! (not (var-get contract-paused)) err-contract-paused)
+        (ok (map-set service-providers
+            tx-sender
+            {
+                name: name,
+                services: services,
+                active: true
+            }
+        ))
+    )
 )
 
 (define-public (update-service-provider-status (active bool))
@@ -296,13 +342,18 @@
             (current-provider-bookings (default-to (list) (map-get? provider-bookings provider)))
             (provider-info (unwrap! (map-get? service-providers provider) err-not-registered))
             (user-registration (unwrap! (map-get? registrations tx-sender) err-not-registered))
+            (conflict-result (has-booking-conflict provider start-time duration))
         )
+        (asserts! (not (var-get contract-paused)) err-contract-paused)
         (asserts! (get active provider-info) err-service-unavailable)
         (asserts! (> start-time stacks-block-height) err-invalid-booking)
-        (asserts! (> duration u0) err-invalid-booking)
-        (asserts! (> cost u0) err-invalid-booking)
+        (asserts! (is-valid-duration duration) err-invalid-duration)
+        (asserts! (is-valid-cost cost) err-invalid-cost)
         (asserts! (and (is-eq (get status user-registration) "active") 
                       (> (get expiration user-registration) stacks-block-height)) err-invalid-status)
+        ;; Advanced booking checks
+        (asserts! (not (get conflict conflict-result)) err-booking-conflict)
+        (asserts! (can-book-priority-slot tx-sender provider start-time) err-insufficient-priority)
         (var-set last-booking-id new-booking-id)
         (map-set service-bookings new-booking-id
             {
@@ -339,9 +390,11 @@
         (
             (booking (unwrap! (map-get? service-bookings booking-id) err-booking-not-found))
         )
+        (asserts! (not (var-get contract-paused)) err-contract-paused)
         (asserts! (is-eq tx-sender (get provider booking)) err-unauthorized-booking)
         (asserts! (not (is-eq (get status booking) "completed")) err-booking-already-completed)
         (asserts! (not (is-eq (get status booking) "cancelled")) err-booking-already-cancelled)
+        (asserts! (is-valid-booking-status new-status) err-invalid-status)
         (if (is-eq new-status "completed")
             (let
                 (
@@ -478,10 +531,13 @@
             (current-owner-equipment (default-to (list) (map-get? owner-equipment tx-sender)))
             (user-registration (unwrap! (map-get? registrations tx-sender) err-not-registered))
         )
+        (asserts! (not (var-get contract-paused)) err-contract-paused)
         (asserts! (and (is-eq (get status user-registration) "active") 
                       (> (get expiration user-registration) stacks-block-height)) err-invalid-status)
-        (asserts! (> daily-rate u0) err-invalid-booking)
-        (asserts! (> deposit-required u0) err-invalid-booking)
+        (asserts! (is-valid-equipment-category category) err-invalid-equipment-category)
+        (asserts! (is-valid-equipment-condition condition) err-invalid-condition)
+        (asserts! (is-valid-daily-rate daily-rate) err-invalid-cost)
+        (asserts! (is-valid-deposit deposit-required) err-invalid-cost)
         (var-set last-equipment-id new-equipment-id)
         (map-set accessibility-equipment new-equipment-id
             {
@@ -532,6 +588,7 @@
             (current-borrower-loans (default-to (list) (map-get? borrower-loans tx-sender)))
             (user-registration (unwrap! (map-get? registrations tx-sender) err-not-registered))
         )
+        (asserts! (not (var-get contract-paused)) err-contract-paused)
         (asserts! (not (is-eq tx-sender (get owner equipment))) err-unauthorized-equipment)
         (asserts! (get available equipment) err-equipment-not-available)
         (asserts! (> start-date stacks-block-height) err-invalid-booking)
@@ -577,6 +634,7 @@
         (
             (loan (unwrap! (map-get? equipment-loans loan-id) err-loan-not-found))
         )
+        (asserts! (not (var-get contract-paused)) err-contract-paused)
         (asserts! (is-eq tx-sender (get owner loan)) err-unauthorized-equipment)
         (asserts! (is-eq (get status loan) "pending") err-invalid-booking)
         (ok (map-set equipment-loans loan-id
@@ -595,6 +653,7 @@
             (equipment (unwrap! (map-get? accessibility-equipment (get equipment-id loan)) err-equipment-not-found))
             (is-late (> stacks-block-height (get end-date loan)))
         )
+        (asserts! (not (var-get contract-paused)) err-contract-paused)
         (asserts! (is-eq tx-sender (get borrower loan)) err-unauthorized-equipment)
         (asserts! (is-eq (get status loan) "approved") err-invalid-booking)
         (asserts! (is-none (get actual-return-date loan)) err-loan-already-returned)
@@ -727,4 +786,215 @@
     )
 )
 
+;; Admin management functions
+(define-public (add-admin (new-admin principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-none (map-get? contract-admins new-admin)) err-already-admin)
+        (ok (map-set contract-admins new-admin true))
+    )
+)
+
+(define-public (remove-admin (admin principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-some (map-get? contract-admins admin)) err-not-admin)
+        (asserts! (not (is-eq admin contract-owner)) err-owner-only) ;; Cannot remove contract owner
+        (ok (map-delete contract-admins admin))
+    )
+)
+
+(define-public (emergency-pause)
+    (begin
+        (asserts! (or (is-eq tx-sender contract-owner) 
+                     (is-some (map-get? contract-admins tx-sender))) err-admin-only)
+        (var-set contract-paused true)
+        (ok true)
+    )
+)
+
+(define-public (emergency-unpause)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only) ;; Only owner can unpause
+        (var-set contract-paused false)
+        (ok true)
+    )
+)
+
+(define-read-only (is-admin (user principal))
+    (is-some (map-get? contract-admins user))
+)
+
+(define-read-only (is-contract-paused)
+    (var-get contract-paused)
+)
+
+;; Helper function to check if contract is paused
+(define-private (check-not-paused)
+    (ok (asserts! (not (var-get contract-paused)) err-contract-paused))
+)
+
+;; Validation helper functions
+(define-private (is-valid-disability-type (disability-type (string-ascii 64)))
+    (or (is-eq disability-type "mobility")
+        (is-eq disability-type "visual")
+        (is-eq disability-type "hearing")
+        (is-eq disability-type "cognitive")
+        (is-eq disability-type "multiple")
+        (is-eq disability-type "temporary")
+        (is-eq disability-type "other"))
+)
+
+(define-private (is-valid-status (status (string-ascii 16)))
+    (or (is-eq status "active")
+        (is-eq status "inactive")
+        (is-eq status "suspended")
+        (is-eq status "pending")
+        (is-eq status "expired"))
+)
+
+(define-private (is-valid-equipment-category (category (string-ascii 32)))
+    (or (is-eq category "mobility")
+        (is-eq category "visual-aid")
+        (is-eq category "hearing-aid")
+        (is-eq category "communication")
+        (is-eq category "daily-living")
+        (is-eq category "therapeutic")
+        (is-eq category "other"))
+)
+
+(define-private (is-valid-booking-status (status (string-ascii 16)))
+    (or (is-eq status "pending")
+        (is-eq status "confirmed")
+        (is-eq status "completed")
+        (is-eq status "cancelled")
+        (is-eq status "in-progress"))
+)
+
+(define-private (is-valid-equipment-condition (condition (string-ascii 16)))
+    (or (is-eq condition "excellent")
+        (is-eq condition "good")
+        (is-eq condition "fair")
+        (is-eq condition "needs-repair")
+        (is-eq condition "damaged"))
+)
+
+(define-private (is-valid-priority-level (priority uint))
+    (and (>= priority u1) (<= priority u5))
+)
+
+(define-private (is-valid-cost (cost uint))
+    (and (> cost u0) (<= cost u100000)) ;; Max cost validation
+)
+
+(define-private (is-valid-duration (duration uint))
+    (and (> duration u0) (<= duration u8760)) ;; Max 1 year in hours
+)
+
+(define-private (is-valid-daily-rate (rate uint))
+    (and (> rate u0) (<= rate u10000)) ;; Max daily rate validation
+)
+
+(define-private (is-valid-deposit (deposit uint))
+    (and (> deposit u0) (<= deposit u100000)) ;; Max deposit validation
+)
+
+;; Advanced booking helper functions
+(define-private (has-booking-conflict (provider principal) (start-time uint) (duration uint))
+    (let
+        (
+            (provider-booking-ids (default-to (list) (map-get? provider-bookings provider)))
+            (end-time (+ start-time duration))
+        )
+        (fold check-booking-overlap provider-booking-ids { start: start-time, end: end-time, conflict: false })
+    )
+)
+
+(define-private (check-booking-overlap (booking-id uint) (acc { start: uint, end: uint, conflict: bool }))
+    (if (get conflict acc)
+        acc
+        (match (map-get? service-bookings booking-id)
+            booking (let
+                (
+                    (booking-start (get start-time booking))
+                    (booking-end (+ (get start-time booking) (get duration booking)))
+                    (booking-status (get status booking))
+                )
+                ;; Check for overlap only with confirmed or pending bookings
+                (if (or (is-eq booking-status "confirmed") (is-eq booking-status "pending"))
+                    (merge acc { conflict: (or 
+                        (and (>= (get start acc) booking-start) (< (get start acc) booking-end))
+                        (and (> (get end acc) booking-start) (<= (get end acc) booking-end))
+                        (and (<= (get start acc) booking-start) (>= (get end acc) booking-end))
+                    ) })
+                    acc
+                )
+            )
+            acc
+        )
+    )
+)
+
+(define-private (can-book-priority-slot (user principal) (provider principal) (start-time uint))
+    (let
+        (
+            (priority-threshold u3) ;; Priority level 3 and above can book priority slots
+            (advance-blocks u1440) ;; 24 hours in blocks (assuming ~1 minute per block)
+            (time-until-booking (- start-time stacks-block-height))
+        )
+        ;; Get user priority, default to 1 if user not registered
+        (match (map-get? registrations user)
+            registration (let
+                (
+                    (user-priority (get priority-level registration))
+                )
+                ;; Priority users can book within 24 hours, non-priority need advance booking
+                (if (>= user-priority priority-threshold)
+                    true  ;; High priority users can book anytime
+                    (>= time-until-booking advance-blocks) ;; Non-priority users must book at least 24 hours ahead
+                )
+            )
+            ;; If user not registered, require advance booking
+            (>= time-until-booking advance-blocks)
+        )
+    )
+)
+
+(define-private (is-booking-expired (booking-id uint))
+    (match (map-get? service-bookings booking-id)
+        booking (let
+            (
+                (booking-time (get booking-time booking))
+                (booking-status (get status booking))
+                (expiration-blocks u1440) ;; 24 hours for confirmation
+            )
+            (and 
+                (is-eq booking-status "pending")
+                (> (- stacks-block-height booking-time) expiration-blocks)
+            )
+        )
+        false
+    )
+)
+
+(define-public (expire-booking (booking-id uint))
+    (let
+        (
+            (booking (unwrap! (map-get? service-bookings booking-id) err-booking-not-found))
+        )
+        (asserts! (is-booking-expired booking-id) err-invalid-booking)
+        (ok (map-set service-bookings booking-id
+            (merge booking { status: "expired" })
+        ))
+    )
+)
+
+(define-read-only (check-booking-conflicts (provider principal) (start-time uint) (duration uint))
+    (let
+        (
+            (result (has-booking-conflict provider start-time duration))
+        )
+        (ok (get conflict result))
+    )
+)
 
